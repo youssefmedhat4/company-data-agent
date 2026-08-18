@@ -1,0 +1,17 @@
+{
+  "name": "company-data-agent-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned DBHub MCP server + a Node runtime new enough to run it. Installed locally so the agent never fetches code from the network at question time.",
+  "scripts": {
+    "dbhub:stdio": "node node_modules/@bytebase/dbhub/dist/index.js --config ./dbhub.toml --transport stdio",
+    "dbhub:http": "node node_modules/@bytebase/dbhub/dist/index.js --config ./dbhub.toml --transport http --host 127.0.0.1 --port 8080"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "@bytebase/dbhub": "1.2.0",
+    "node": "22.22.0"
+  }
+}

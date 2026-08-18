@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets and local env
+.env
+.env.*
+
+# Runtime / logs — may contain query text and salary-flag history
+audit.log
+dbhub.log
+dbhub.runtime.toml
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

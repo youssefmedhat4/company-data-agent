@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>Company Data Agent</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#composerInput">Skip to the message composer</a>
+
+<div class="app" id="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Conversations">
+    <div class="sidebar-head">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true" data-icon="database" data-size="14"></span>
+        <span class="brand-name">Company Data</span>
+      </div>
+      <button type="button" class="ghost-btn" id="newChatBtn">
+        <span data-icon="plus" aria-hidden="true"></span>
+        New chat
+      </button>
+      <div class="search-field">
+        <span data-icon="search" data-size="14" aria-hidden="true"></span>
+        <input type="search" id="searchInput" placeholder="Search conversations"
+               aria-label="Search conversations" autocomplete="off">
+      </div>
+    </div>
+
+    <nav class="conv-list" id="convList" aria-label="Conversation history"></nav>
+
+    <div class="sidebar-foot">
+      <span class="env-meta" id="envMeta" title="Model and database in use">connecting…</span>
+      <button type="button" class="icon-btn" id="themeToggle"
+              aria-label="Switch to dark theme"></button>
+    </div>
+  </aside>
+
+  <main class="main" id="main" data-empty="true">
+    <header class="chat-header">
+      <button type="button" class="icon-btn" id="sidebarToggle"
+              aria-label="Show conversations" aria-expanded="false" aria-controls="sidebar">
+        <span data-icon="panel-left" aria-hidden="true"></span>
+      </button>
+      <h1 class="chat-title" id="chatTitle">New chat</h1>
+      <button type="button" class="icon-btn" id="clearBtn" aria-label="Clear this conversation">
+        <span data-icon="eraser" aria-hidden="true"></span>
+      </button>
+    </header>
+
+    <div class="banner" id="previewBanner" hidden>
+      <span data-icon="alert" data-size="14" aria-hidden="true"></span>
+      <span>Preview data — the agent is not connected. Run
+        <code>python webapp.py</code> and open http://127.0.0.1:5000 for real answers.</span>
+    </div>
+
+    <div class="conversation" id="conversation" tabindex="-1">
+      <div class="conversation-inner" id="messageList"></div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer-wrap-inner">
+        <form class="composer" id="composer">
+          <label class="sr-only" for="composerInput">Ask a question about the company data</label>
+          <textarea id="composerInput" rows="1" dir="auto" autocomplete="off"
+                    placeholder="Ask about revenue, orders or staff…  اسأل بالعربية"></textarea>
+          <div class="composer-actions">
+            <button type="button" class="icon-btn" id="sensitiveBtn" aria-pressed="false"
+                    aria-label="Allow sensitive data such as salaries"
+                    title="Allow sensitive data (salaries)">
+              <span data-icon="lock" aria-hidden="true"></span>
+            </button>
+            <button type="submit" class="send-btn" id="sendBtn" disabled aria-label="Send message">
+              <span data-icon="arrow-up" aria-hidden="true"></span>
+            </button>
+          </div>
+        </form>
+        <p class="composer-hint">
+          <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line ·
+          every figure is read from the database
+        </p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="sr-only" role="status" aria-live="polite" id="liveRegion"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
