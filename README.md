@@ -1,6 +1,6 @@
 # Company Data Agent
 
-Ask questions in Arabic or English, get real answers from the database.
+Ask questions in Arabic or English, get answers from the connected database.
 Everything runs locally. No data leaves the machine.
 
 ---
@@ -11,26 +11,29 @@ Everything runs locally. No data leaves the machine.
   you type a question
          │
          ▼
-   agent.py ──────────► Ollama (gemma4:12b)
+   webapp.py / agent.py ──► Ollama (gemma4:12b)
          │  ▲
-         │  └── execute_sql  (schema is injected; not guessed)
+         │  └── execute_sql
          ▼
    mcp_client.py  ►  DBHub (read-only)  ►  your database
          │
-    guard_sql()     one SELECT, optional allow-list, sensitive-name gate
+    schema_snapshot()   table and column names, injected into the prompt
+    guard_sql()         one SELECT, optional allow-list, sensitive-name gate
 ```
 
-Python loads the live schema once and puts it in the prompt. The model’s
-job is `execute_sql`, not hunting for table names. `search_objects` stays
-available only if that snapshot fails. The grounding check still requires
-every number in the answer to have come from a tool result.
+Python loads the live schema once and puts it in the prompt. The model’s job
+is `execute_sql`, not hunting for table names. `search_objects` is only
+offered if that snapshot fails. Charts are drawn from the SQL rows (pie for
+a category split, line for time, bar otherwise). The grounding check still
+requires every number in the answer to have come from a tool result.
 
 | File | What it is | Do you edit it? |
 |---|---|---|
 | `catalog.py` | Connection, sensitive names, row cap | **Yes** |
 | `dbhub.toml` | DBHub readonly + row cap | When pointing at a real DB |
-| `mcp_client.py` | DBHub launcher + SQL guard | Rarely |
+| `mcp_client.py` | DBHub launcher + SQL guard + schema snapshot | Rarely |
 | `agent.py` | The Ollama loop + grounding check | Rarely |
+| `webapp.py` + `static/` | Local chat UI | Rarely |
 | `setup_demo.py` | Builds a sample SQLite file | No |
 
 ---
@@ -45,7 +48,8 @@ python webapp.py
 ```
 
 Then open http://127.0.0.1:5000. `npm install` pulls the pinned DBHub MCP
-server. The UI binds to localhost only.
+server. The UI binds to localhost only. The lock button allows identifiers
+listed in `SENSITIVE_IDENTIFIERS`; leave it off by default.
 
 CLI instead of the browser:
 
@@ -61,31 +65,10 @@ what was revenue last quarter?
 what is Sara Ibrahim's salary?
 show me revenue by region for the year
 which region is شركة النيل in?
-how is revenue calculated?
 ```
 
-Watch the `->` lines: those are the tools being called. That's the agent loop
-you designed, running for real.
-
----
-
-## Chat UI
-
-A minimal local web chat sits in front of the same agent loop, at
-`webapp.py` + `static/`. It talks to Ollama and the database exactly the
-way the CLI does -- `webapp.py` just forwards each question to
-`agent.ask()` and renders the tool trace, the grounded answer, and any
-chart the model requested (drawn from the tool's actual numbers, never
-from anything the model typed in the `CHART:` line).
-
-```powershell
-pip install flask
-python webapp.py
-```
-
-Then open http://127.0.0.1:5000. It binds to localhost only. The lock
-button allows identifiers listed in `SENSITIVE_IDENTIFIERS`; leave it off
-by default.
+Watch the `->` lines: those are the SQL calls. A second `python webapp.py`
+on the same port is refused; stop the old process first.
 
 ---
 
@@ -102,12 +85,15 @@ In `catalog.py` (or the `DB_URL` environment variable):
 DB_URL = "postgresql+psycopg://agent_ro:pass@host:5432/yourdb"
 ```
 
-DBHub is pointed at the same database at startup. Optional:
+Optional:
 
 ```
 SENSITIVE_IDENTIFIERS=salary,ssn,password
 ALLOWED_OBJECTS=               # empty = every table/view
 ```
+
+DBHub is pointed at the same database at startup (`dbhub.toml` `dsn` is
+rewritten from `DB_URL`). Keep `readonly = true`.
 
 ### Step 2 — make a read-only user
 
@@ -127,23 +113,29 @@ omit `salary` from a staff view) or rename cryptic names. If you do, list
 the hidden names in `SENSITIVE_IDENTIFIERS` so `execute_sql` cannot reach
 around the view.
 
-### Step 3 — restart
+### Step 3 — bilingual names (optional)
 
-```powershell
-python webapp.py
+If people or companies are stored in Arabic (or another script) and users
+type English, add a `name_norm` column and search that, not `name_ar` alone.
+
+`setup_demo.py` stores both scripts in one column:
+
+```
+name_norm = folded_arabic + " | " + english.lower()
 ```
 
-`/api/health` should show DBHub connected with tools `search_objects` and
-`execute_sql`. Suggested prompts on the empty screen come from the live schema.
+Without that, “Ahmed Hassan” will not match `أحمد حسن`.
 
-### Step 4 — test the database layer
+### Step 4 — test, then restart
 
 ```powershell
 python mcp_client.py
+python webapp.py
 ```
 
-That starts DBHub, lists its tools, and runs one guarded SELECT. Only then
-run `python webapp.py` or `python agent.py`.
+`python mcp_client.py` starts DBHub, lists its tools, prints the schema
+snapshot, and runs one guarded SELECT. `/api/health` should show DBHub
+connected. Suggested prompts on the empty screen come from the live schema.
 
 ---
 
@@ -159,16 +151,12 @@ Set these once, permanently:
 ```
 
 `OLLAMA_NO_CLOUD=1` is a machine-level guarantee that nothing routes to
-Ollama's servers. Worth citing in the security review.
+Ollama's servers.
 
 Keep the database password out of the code:
 
 ```powershell
 [Environment]::SetEnvironmentVariable("DB_URL", "postgresql+psycopg://...", "User")
-```
-```python
-import os
-DB_URL = os.environ["DB_URL"]
 ```
 
 ---
@@ -186,36 +174,19 @@ DB_URL = os.environ["DB_URL"]
 
 **None of these depend on the model behaving well.** That is the point.
 
-Check the audit log any time:
 ```powershell
 Get-Content audit.log -Tail 20
 ```
 
 ---
 
-## DBHub (the MCP database server)
-
-The agent launches DBHub itself. You do not start it by hand.
-
-```powershell
-python mcp_client.py          # smoke test: start DBHub, list tools, one query
-```
-
-To point at a real database, edit `dbhub.toml` (`dsn`) and `catalog.py`
-(`DB_URL` plus entities/metrics) together. Keep `readonly = true`.
-
----
-
 ## What to build next
 
-1. **Your eval set.** 30–50 real questions **with the correct answers written
-   down.** Your tests so far check tool choice, not correctness — that gap is
-   how a system scores 100% and still returns "not found" for half your staff.
-2. **Chart rendering.** The agent already emits a `CHART:` spec. Render it in
-   your frontend — never execute model-generated plotting code.
-3. **A gateway** (LiteLLM) in front of Ollama, for per-user auth and a second
+1. **Your eval set.** 30–50 real questions with the correct answers written
+   down. Tool-choice tests can pass while the SQL is still wrong.
+2. **A gateway** (LiteLLM) in front of Ollama, for per-user auth and a second
    audit trail.
-4. **Per-user sessions.** Right now `allow_sensitive` is a single flag. Tie it
+3. **Per-user sessions.** Right now `allow_sensitive` is a single flag. Tie it
    to the authenticated user before anyone touches real salary data.
 
 ---
@@ -225,6 +196,9 @@ To point at a real database, edit `dbhub.toml` (`dsn`) and `catalog.py`
 **DBHub will not start** → `npm install`, then `python mcp_client.py`. Node
 must be 22.5 or newer (this repo pins 22.22.0 under `node_modules`).
 
+**A second webapp on port 5000** → stop the old `python webapp.py` first.
+Windows can let both bind; the old process keeps answering.
+
 **execute_sql refused** → one SELECT only. Writes, PRAGMA, EXPLAIN, and extra
 statements are blocked. Sensitive names in `SENSITIVE_IDENTIFIERS` need the
 privacy toggle. If `ALLOWED_OBJECTS` is set, FROM/JOIN must stay inside it.
@@ -233,4 +207,8 @@ privacy toggle. If `ALLOWED_OBJECTS` is set, FROM/JOIN must stay inside it.
 result. Usually the query returned nothing useful and the model filled the gap.
 
 **Slow responses** → `ollama ps` shows whether the model is loaded on GPU or
-CPU. CPU inference on a 12B model is minutes, not seconds.
+CPU. One question is two generations (write SQL, then write the answer).
+CPU inference on a 12B model is minutes, not seconds.
+
+**No chart** → a single total is shown as a number on purpose. Ask for a
+split (by region, by month) so there are two or more groups to draw.

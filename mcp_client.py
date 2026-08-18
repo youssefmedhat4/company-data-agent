@@ -145,10 +145,8 @@ def server_command() -> tuple[list[str], str]:
 # ===================================================================
 # The SQL guard
 # ===================================================================
-# Objects the model may read, derived from catalog.py so that pointing this
-# project at a new database does not mean editing this file. Anything not
-# listed here is refused, including every raw table -- the views are where
-# column masking lives, so reading a table directly would step around it.
+# Objects the model may FROM/JOIN. Empty ALLOWED_OBJECTS means generic mode:
+# any table or view is fine (minus sqlite internals and sensitive names).
 
 def _allowed_objects() -> set[str] | None:
     allowed = {n.lower() for n in getattr(catalog, "ALLOWED_OBJECTS", ()) if n}
@@ -161,8 +159,7 @@ def _sensitive_tokens() -> set[str]:
 
 # Anything that writes, changes session state, reaches the filesystem, or opens
 # a second database. DBHub's own read-only mode permits PRAGMA and EXPLAIN; this
-# project does not, because PRAGMA is both a schema-disclosure and a
-# session-state channel and the model has search_objects for schema questions.
+# project does not. Schema comes from schema_snapshot(), not from PRAGMA.
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|create|alter|replace|truncate|rename"
     r"|attach|detach|pragma|vacuum|reindex|analyze|explain|begin|commit"
@@ -172,8 +169,7 @@ _FORBIDDEN = re.compile(
 )
 
 # SQLite's own catalogue. Reading it would disclose the full schema, including
-# the DDL text of restricted views, and is a way to name an object without
-# writing its name. search_objects is the sanctioned route to schema questions.
+# the DDL text of restricted views.
 _INTERNAL = re.compile(r"\bsqlite_(master|schema|temp_master|temp_schema|sequence|stat\d*)\b",
                        re.IGNORECASE)
 
@@ -190,7 +186,6 @@ def guard_sql(sql: str, allow_sensitive: bool = False) -> str | None:
 
     Deliberately conservative: when in doubt it refuses, because a false
     refusal costs the model one retry while a false approval costs a data leak.
-    The message is written for the model, so it can fix the query and try again
     The message is written for the model, so it can fix the query and try again
     rather than giving up.
     """
@@ -216,8 +211,8 @@ def guard_sql(sql: str, allow_sensitive: bool = False) -> str | None:
                 "SELECT; it cannot write, change settings, or run PRAGMA/EXPLAIN.")
 
     if _INTERNAL.search(stripped):
-        return ("SQLite's internal tables are not readable. Use search_objects to "
-                "find tables, views and columns.")
+        return ("SQLite's internal tables are not readable. Use the SCHEMA in "
+                "the system prompt, or search_objects, to find names.")
 
     # Object allow-list. None means generic mode: any table/view is fine.
     # Names introduced by a WITH clause are allowed because they resolve to a
@@ -386,7 +381,6 @@ class DBHubClient:
 
     def call(self, name: str, args: dict, timeout: float = CALL_TIMEOUT_SEC) -> dict:
         """Call one DBHub tool. Never raises: a failure comes back as
-        {"error": ...} so agent.py's loop can show the model what went wrong
         {"error": ...} so agent.py's loop can show the model what went wrong
         and let it try something else.
         """
@@ -561,32 +555,17 @@ def _clean_schema(schema: dict | None) -> dict:
 
 
 def visible_tables(allow_sensitive: bool = False) -> list[str]:
-    """Table/view names DBHub can see, for the empty-state prompts."""
-    try:
-        client = get_client()
-        result = invoke(client, "search_objects",
-                        {"object_type": "table", "detail_level": "names", "limit": 40},
-                        allow_sensitive)
-    except Exception:
-        return []
+    """Table/view names for the empty-state prompts. Names only, never rows."""
     names: list[str] = []
     seen: set[str] = set()
-
-    def walk(node):
-        if isinstance(node, dict):
-            name = node.get("name") or node.get("table") or node.get("view")
-            typ = str(node.get("type") or node.get("object_type") or "").lower()
-            if isinstance(name, str) and name.lower() not in seen:
-                if not typ or typ in {"table", "view", "base table", "tables", "views"}:
-                    seen.add(name.lower())
-                    names.append(name)
-            for value in node.values():
-                walk(value)
-        elif isinstance(node, list):
-            for value in node:
-                walk(value)
-
-    walk(result)
+    for line in schema_snapshot(allow_sensitive).splitlines():
+        m = re.match(r"(?:table|view)\s+([A-Za-z_][\w.$]*)", line, re.I)
+        if not m:
+            continue
+        name = m.group(1)
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
     return names[:20]
 
 

@@ -71,7 +71,7 @@ def api_schema():
     except Exception as exc:
         return jsonify({"tables": [], "error": str(exc)})
     prompts = [{"text": "What tables and views are in this database?",
-                "hint": "discovers the schema"}]
+                "hint": "lists tables and views"}]
     if tables:
         sample = tables[0]
         prompts.append({"text": f"Show 5 rows from {sample}",
@@ -144,7 +144,7 @@ def api_ask_stream():
 
 def _port_already_serving(port: int = 5000) -> bool:
     """Windows lets a second process bind a loopback port that is already in use,
-    after which either server may answer. The older one keeps serving the catalog
+    after which either server may answer. The older one keeps serving the code
     it loaded at startup, so edits appear to have no effect. Refuse instead."""
     with socket.socket() as probe:
         probe.settimeout(0.4)

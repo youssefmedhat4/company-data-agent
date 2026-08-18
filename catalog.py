@@ -2,8 +2,8 @@
 """
 Connection and policy for whichever database you point this agent at.
 
-The agent does not hard-code your tables. It asks DBHub for the schema
-(search_objects) and reads data with execute_sql.
+The agent does not hard-code your tables. Python loads a live schema
+snapshot from DBHub and the model reads rows with execute_sql.
 
   1. DB_URL                  -- how to connect (or set the DB_URL env var)
   2. SENSITIVE_IDENTIFIERS   -- table/view/column names that need the privacy toggle
@@ -55,5 +55,4 @@ ALLOWED_OBJECTS = _csv("ALLOWED_OBJECTS", "")
 # 4. SAFETY LIMITS
 # ---------------------------------------------------------------
 MAX_ROWS = 50
-QUERY_TIMEOUT_SEC = 10
 AUDIT_LOG = "audit.log"

@@ -23,7 +23,7 @@ source = "main"
 # Layer 1 of read-only enforcement lives here: DBHub checks each statement
 # against its read-only keyword allow-list AND runs it under SQLite's
 # PRAGMA query_only = ON. Layer 2 is mcp_client.guard_sql() in this project,
-# which is stricter (single statement, SELECT only, no PRAGMA, salary gate).
+# which is stricter (single statement, SELECT only, no PRAGMA, sensitive-name gate).
 readonly = true
 # Kept in step with catalog.MAX_ROWS. mcp_client.py asserts they match at
 # startup so the two cannot drift apart silently.

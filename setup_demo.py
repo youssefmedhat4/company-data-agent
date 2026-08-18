@@ -85,8 +85,9 @@ def main() -> None:
     cur.execute("CREATE INDEX idx_emp_norm ON employees(name_norm)")
     cur.execute("CREATE INDEX idx_cust_norm ON customers(name_norm)")
 
-    # Curated views: the ONLY thing the tools are allowed to read.
-    # Note salary is NOT in the public employee view.
+    # Optional views: hide salary from the public staff view, join customer
+    # names onto orders. The agent can still read the base tables unless you
+    # set ALLOWED_OBJECTS or SENSITIVE_IDENTIFIERS.
     cur.execute("""
         CREATE VIEW v_employees AS
         SELECT id, name_ar, name_en, name_norm, department, hired_on

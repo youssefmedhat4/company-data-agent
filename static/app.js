@@ -280,8 +280,6 @@ function chooseChartType(cd) {
   const n = values.length;
   if (looksLikeTime(labels)) return 'line';
   const allNonNeg = n > 0 && values.every((v) => v >= 0);
-  const want = String(cd.type || '').toLowerCase();
-  if (want === 'pie' && n >= 2 && n <= 8 && allNonNeg) return 'pie';
   if (n >= 2 && n <= 8 && allNonNeg) return 'pie';
   return 'bar';
 }
@@ -499,13 +497,6 @@ function sqlRows(result) {
 
 function seriesFromRows(rows) {
   if (!Array.isArray(rows) || rows.length < 2) return null;
-  if (rows.every((r) => r && 'group_key' in r && 'value' in r)) {
-    return {
-      labels: rows.map((r) => String(r.group_key ?? '')),
-      values: rows.map((r) => r.value),
-      title: 'value',
-    };
-  }
   const keys = Object.keys(rows[0] || {});
   if (keys.length < 2) return null;
   const labelKey = keys[0];
@@ -707,7 +698,7 @@ function rawDisclosure(calls) {
 /* --- EmptyState / SuggestedPrompts ---------------------------------------- */
 
 let SUGGESTED = [
-  { text: 'What tables and views are in this database?', hint: 'discovers the schema' },
+  { text: 'What tables and views are in this database?', hint: 'lists tables and views' },
   { text: 'What data can I ask about?', hint: 'lists what is readable' },
 ];
 

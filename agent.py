@@ -2,8 +2,8 @@
 """
 AGENT — connects Ollama to DBHub.
 
-This is the loop: question -> DBHub tool -> result -> grounded answer.
-Only two tools exist: search_objects (schema) and execute_sql (data).
+This is the loop: schema snapshot in the prompt, then execute_sql, then a
+grounded answer. search_objects is only offered if the snapshot fails.
 
 Run interactively:
     python agent.py
@@ -133,7 +133,7 @@ def _chart_data(chart: dict | None, call_log: list[dict]):
         if len(labels) < 2:
             continue
         if not title:
-            keys = [k for k in rows[0].keys() if k not in {"group_key"}]
+            keys = list(rows[0].keys())
             title = str(keys[-1]).replace("_", " ") if keys else ""
         return {
             "type": _choose_chart_type(labels, values, requested),
@@ -178,7 +178,7 @@ def _looks_like_time(labels: list[str]) -> bool:
     return hits >= max(2, int(len(labels) * 0.6))
 
 
-def _choose_chart_type(labels: list[str], values: list, requested=None) -> str:
+def _choose_chart_type(labels: list[str], values: list, _requested=None) -> str:
     """Type comes from the series, not from the model's CHART habit (always bar)."""
     n = len(values)
     nums = []
@@ -190,17 +190,12 @@ def _choose_chart_type(labels: list[str], values: list, requested=None) -> str:
     if _looks_like_time(labels):
         return "line"
     all_nonneg = bool(nums) and all(x >= 0 for x in nums)
-    want = str(requested or "").strip().lower()
-    if want == "pie" and 2 <= n <= 8 and all_nonneg:
-        return "pie"
     if 2 <= n <= 8 and all_nonneg:
         return "pie"
     return "bar"
 
 
 def _chart_series(rows: list[dict]) -> tuple[list[str], list]:
-    if all("group_key" in r and "value" in r for r in rows):
-        return [str(r.get("group_key", "")) for r in rows], [r.get("value") for r in rows]
     keys = list(rows[0].keys())
     if len(keys) < 2:
         return [], []
@@ -379,8 +374,8 @@ def main() -> None:
     if len(sys.argv) > 1:
         out = ask(" ".join(sys.argv[1:]))
         print("\n" + out["answer"])
-        if out["chart"]:
-            print(f"\n[chart spec] {json.dumps(out['chart'], ensure_ascii=False)}")
+        if out.get("chart_data"):
+            print(f"\n[chart] {json.dumps(out['chart_data'], ensure_ascii=False)}")
         return
 
     print(f"\nAgent ready  (model: {MODEL}, db: {catalog.DB_URL})")
@@ -398,8 +393,8 @@ def main() -> None:
 
         out = ask(q)
         print(f"\nbot > {out['answer']}")
-        if out["chart"]:
-            print(f"      [chart] {json.dumps(out['chart'], ensure_ascii=False)}")
+        if out.get("chart_data"):
+            print(f"      [chart] {json.dumps(out['chart_data'], ensure_ascii=False)}")
         if out["ungrounded"]:
             print(f"      WARNING ungrounded numbers: {out['ungrounded']}")
         print()
