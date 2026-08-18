@@ -5,7 +5,7 @@ WEBAPP -- a minimal local chat UI in front of agent.py.
 Runs a Flask server bound to 127.0.0.1 only (not reachable from the
 network). The browser talks to this process over loopback HTTP; this
 process talks to Ollama and the database exactly the way agent.py's CLI
-does. Nothing here bypasses db_tools.py's security controls -- this file
+does. Nothing here bypasses mcp_client.guard_sql() -- this file
 adds zero new logic beyond serving the page and forwarding the question
 to agent.ask().
 
@@ -37,18 +37,13 @@ def index():
 
 @app.get("/api/health")
 def api_health():
-    """Lets the UI show which model and database are actually in use. `metrics` and
-    `pid` are here because a server left running from an earlier session keeps
-    answering with the catalog it loaded at startup, which looks like the model
-    refusing to use a metric that plainly exists on disk."""
+    """Lets the UI show which model and database are actually in use. `pid`
+    is here because a server left running from an earlier session keeps
+    answering with the process that loaded first."""
     return jsonify({
         "model": agent.MODEL,
         "db": agent.catalog.DB_URL,
         "pid": os.getpid(),
-        "metrics": sorted(agent.catalog.METRICS),
-        "restricted_metrics": sorted(
-            name for name, spec in agent.catalog.METRICS.items() if spec.get("sensitive")
-        ),
         "mcp": _mcp_status(),
     })
 
@@ -66,6 +61,30 @@ def _mcp_status() -> dict:
         }
     except Exception as exc:
         return {"server": "dbhub", "error": str(exc)}
+
+
+@app.get("/api/schema")
+def api_schema():
+    """Live table/view names for the empty-state prompts. Never returns rows."""
+    try:
+        tables = mcp_client.visible_tables(allow_sensitive=False)
+    except Exception as exc:
+        return jsonify({"tables": [], "error": str(exc)})
+    prompts = [{"text": "What tables and views are in this database?",
+                "hint": "discovers the schema"}]
+    if tables:
+        sample = tables[0]
+        prompts.append({"text": f"Show 5 rows from {sample}",
+                        "hint": "sample of live data"})
+        prompts.append({"text": f"How many rows are in {sample}?",
+                        "hint": "a count from the database"})
+        if len(tables) > 1:
+            prompts.append({"text": f"What columns does {tables[1]} have?",
+                            "hint": "schema detail"})
+    else:
+        prompts.append({"text": "What data can I ask about?",
+                        "hint": "lists what is readable"})
+    return jsonify({"tables": tables, "prompts": prompts[:4]})
 
 
 def _read_question():

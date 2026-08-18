@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light dark">
-<title>Company Data Agent</title>
+<title>Data Agent</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -16,7 +16,7 @@
     <div class="sidebar-head">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true" data-icon="database" data-size="14"></span>
-        <span class="brand-name">Company Data</span>
+        <span class="brand-name">Data Agent</span>
       </div>
       <button type="button" class="ghost-btn" id="newChatBtn">
         <span data-icon="plus" aria-hidden="true"></span>
@@ -63,13 +63,13 @@
     <div class="composer-wrap">
       <div class="composer-wrap-inner">
         <form class="composer" id="composer">
-          <label class="sr-only" for="composerInput">Ask a question about the company data</label>
+          <label class="sr-only" for="composerInput">Ask a question about the database</label>
           <textarea id="composerInput" rows="1" dir="auto" autocomplete="off"
-                    placeholder="Ask about revenue, orders or staff…  اسأل بالعربية"></textarea>
+                    placeholder="Ask a question about this database…"></textarea>
           <div class="composer-actions">
             <button type="button" class="icon-btn" id="sensitiveBtn" aria-pressed="false"
-                    aria-label="Allow sensitive data such as salaries"
-                    title="Allow sensitive data (salaries)">
+                    aria-label="Allow sensitive columns and tables"
+                    title="Allow sensitive data">
               <span data-icon="lock" aria-hidden="true"></span>
             </button>
             <button type="submit" class="send-btn" id="sendBtn" disabled aria-label="Send message">

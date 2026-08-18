@@ -48,9 +48,9 @@ measurable gain on this task. Only reconsider if a NEW eval task fails.
 
 ## Two real bugs found during testing, and their fixes — do not regress these
 
-**Bug 1: the model fabricated a salary.** `search_entities` returned a
-record with no salary field; the model invented "15,000" in fluent prose
-instead of calling `get_records`. Fixed two ways:
+**Bug 1: the model fabricated a salary.** A lookup returned a record with
+no salary field; the model invented "15,000" in fluent prose instead of
+querying the salary column. Fixed two ways:
   - System prompt hard rule: "never state a number that did not appear in
     a tool result" (see `agent.py` SYSTEM_PROMPT).
   - A **grounding check**: every number in the final answer is checked
@@ -72,41 +72,26 @@ failure will recur silently.
 ## Architecture
 
 ```
-agent.py --calls--> db_tools.py  (curated tools)
-                 --> mcp_client.py --> DBHub (stdio, readonly) --> views
+agent.py --calls--> mcp_client.py --> DBHub (stdio, readonly) --> database
 ```
 
-`mcp_client.guard_sql()` is a second gate in front of DBHub's `execute_sql`:
-one SELECT, catalog views only, salary blocked unless `allow_sensitive`.
-DBHub's own `readonly = true` only stops writes. The grounding check in
-`agent.py` still applies to every number, including SQL results.
+Only two tools: `search_objects` (schema) and `execute_sql` (data).
+`mcp_client.guard_sql()` runs before SQL reaches DBHub: one SELECT, optional
+object allow-list, sensitive identifiers blocked unless `allow_sensitive`.
+DBHub's `readonly = true` only stops writes. The grounding check in
+`agent.py` still applies to every number.
 
-`db_tools.py` has no MCP and no Ollama dependency by design — it's testable
-in isolation. All curated-tool security lives there:
-- SELECT-only, parameterized queries, no string-built SQL
-- Hard row limit (`catalog.MAX_ROWS`, currently 50)
-- ID provenance: `get_records` rejects any id `search_entities` didn't
-  issue this session (prevents the "wrong person's salary" failure class)
-- Sensitive entities (e.g. `employee_salary`) require `allow_sensitive=True`
-- Bidi/control characters stripped from all returned text
-- Every call written to `audit.log`
+`catalog.py` is the file to change per deployment — `DB_URL`, optional
+`SENSITIVE_IDENTIFIERS`, optional `ALLOWED_OBJECTS`. Currently defaults to
+`demo.db`. **The real database connection string should never be pasted into
+a cloud AI tool.**
 
-`catalog.py` is the ONLY file meant to change per deployment — connection
-string, entities, metrics, periods. Currently points at `demo.db` (SQLite,
-fake data) built by `setup_demo.py`. **The real database connection string
-and schema details should never be pasted into a cloud AI tool** — edit
-`catalog.py` locally by hand, or only with a fully local coding assistant.
+## Tool design
 
-## Tool design — curated first, SQL as a guarded escape hatch
-
-Free-form SQL used to be rejected outright. It is now available through
-DBHub's `execute_sql`, but only after `guard_sql()`: one SELECT, curated
-views only, salary gated. The six curated tools
-(`list_data_areas`, `search_entities`, `list_entities`, `get_metric`,
-`get_records`, `describe_metric`) remain the default path. Keep total
-tool count small — smaller models degrade past ~8, per the loop test
-above. `execute_sql` weakens ID provenance for whatever the model
-SELECTs; the grounding check and salary gate are what remain.
+The six curated tools are gone. Schema comes from DBHub at question time.
+`execute_sql` is weaker than parameterized tools (the model authors SQL);
+the remaining guarantees are the SELECT-only guard, the optional allow-list,
+the sensitive-name gate, the row cap, the audit log, and grounding.
 
 ## Known gaps / next steps
 
@@ -127,8 +112,6 @@ SELECTs; the grounding check and salary gate are what remain.
 
 Preserve, in order of importance:
 1. The grounding check — never let a code path skip it
-2. ID provenance checks — never let a tool accept a client-supplied ID
-   without checking it was issued this session
-3. Read-only, parameterized queries — never string-concatenate into SQL
-4. The catalog.py / db_tools.py separation — don't hardcode schema details
-   into db_tools.py
+2. Read-only SQL — `guard_sql` must stay in front of execute_sql
+3. Do not reintroduce a parallel tool layer beside DBHub
+4. `catalog.py` stays connection + policy, not a schema dump

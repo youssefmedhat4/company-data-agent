@@ -20,8 +20,8 @@ only this project knows. So guard_sql() below is not duplicated effort; it
 enforces a different rule than DBHub does. The two layers:
 
     DBHub  : no writes at all (keyword classifier + PRAGMA query_only = ON)
-    here   : one read-only SELECT, only against catalog-approved views,
-             and nothing touching salary unless allow_sensitive is True
+    here   : one read-only SELECT, optional ALLOWED_OBJECTS, and nothing
+             matching SENSITIVE_IDENTIFIERS unless allow_sensitive is True
 
 THREADING: the MCP Python SDK is async and agent.py is synchronous, so the
 session lives in one dedicated background thread with its own event loop and
@@ -38,7 +38,7 @@ import re
 import shutil
 import subprocess
 import threading
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -150,39 +150,13 @@ def server_command() -> tuple[list[str], str]:
 # listed here is refused, including every raw table -- the views are where
 # column masking lives, so reading a table directly would step around it.
 
-def _allowed_objects(allow_sensitive: bool) -> set[str]:
-    allowed = set()
-    for spec in list(catalog.ENTITIES.values()) + list(catalog.METRICS.values()):
-        if spec.get("sensitive") and not allow_sensitive:
-            continue
-        allowed.add(spec["view"].lower())
-    return allowed
+def _allowed_objects() -> set[str] | None:
+    allowed = {n.lower() for n in getattr(catalog, "ALLOWED_OBJECTS", ()) if n}
+    return allowed or None
 
 
 def _sensitive_tokens() -> set[str]:
-    """Identifiers that only appear in queries reaching restricted data.
-
-    Two groups, both read out of catalog.py:
-      - the views of sensitive entities and metrics (v_employees_sensitive),
-      - the columns a sensitive entity exposes that its non-sensitive twin
-        does not (salary).
-    Plus the raw tables those views are built on, which cannot be inferred
-    from the catalog and so are named in catalog.RAW_TABLES.
-    """
-    tokens = set()
-    for name, spec in catalog.ENTITIES.items():
-        if not spec.get("sensitive"):
-            continue
-        tokens.add(spec["view"].lower())
-        peer = catalog.ENTITIES.get(spec.get("shares_ids_with") or "", {})
-        public_cols = {c.lower() for c in peer.get("detail_columns", [])}
-        tokens |= {c.lower() for c in spec.get("detail_columns", [])
-                   if c.lower() not in public_cols}
-    for spec in catalog.METRICS.values():
-        if spec.get("sensitive"):
-            tokens.add(spec["view"].lower())
-    tokens |= {t.lower() for t in getattr(catalog, "RAW_TABLES", ())}
-    return tokens
+    return {t.lower() for t in getattr(catalog, "SENSITIVE_IDENTIFIERS", ()) if t}
 
 
 # Anything that writes, changes session state, reaches the filesystem, or opens
@@ -217,7 +191,8 @@ def guard_sql(sql: str, allow_sensitive: bool = False) -> str | None:
     Deliberately conservative: when in doubt it refuses, because a false
     refusal costs the model one retry while a false approval costs a data leak.
     The message is written for the model, so it can fix the query and try again
-    rather than giving up -- the same style as the errors db_tools.py returns.
+    The message is written for the model, so it can fix the query and try again
+    rather than giving up.
     """
     if not isinstance(sql, str) or not sql.strip():
         return "sql is required and must be a non-empty string."
@@ -244,28 +219,71 @@ def guard_sql(sql: str, allow_sensitive: bool = False) -> str | None:
         return ("SQLite's internal tables are not readable. Use search_objects to "
                 "find tables, views and columns.")
 
-    # Object allow-list. Names introduced by a WITH clause are allowed because
-    # they resolve to a SELECT that is itself checked by this same pass.
-    allowed = _allowed_objects(allow_sensitive)
+    # Object allow-list. None means generic mode: any table/view is fine.
+    # Names introduced by a WITH clause are allowed because they resolve to a
+    # SELECT that is itself checked by this same pass.
+    allowed = _allowed_objects()
     ctes = {c.lower() for c in _CTE_NAME.findall(stripped)}
-    for raw in _OBJECT_REF.findall(stripped):
-        obj = raw.strip('"[]`').lower()
-        obj = obj.rsplit(".", 1)[-1]          # main.v_orders -> v_orders
-        if obj in ctes or obj in allowed:
-            continue
-        return (f"'{obj}' cannot be read. Readable views are: "
-                f"{sorted(allowed)}. Query one of those instead.")
+    if allowed is not None:
+        for raw in _OBJECT_REF.findall(stripped):
+            obj = raw.strip('"[]`').lower()
+            obj = obj.rsplit(".", 1)[-1]
+            if obj in ctes or obj in allowed:
+                continue
+            return (f"'{obj}' cannot be read. Readable objects are: "
+                    f"{sorted(allowed)}. Query one of those instead.")
 
-    # The privacy gate. Salary lives in a column and a view whose names are the
-    # only way to reach it, so refusing the names refuses the data.
     if not allow_sensitive:
         for token in _sensitive_tokens():
             if re.search(rf"\b{re.escape(token)}\b", stripped, re.IGNORECASE):
-                return ("this query touches restricted salary data, which the "
-                        "current user is not permitted to see. Answer without it, "
-                        "and say plainly that salary information is not available.")
+                return ("this query touches restricted data, which the current "
+                        "user is not permitted to see. Answer without it, or ask "
+                        "the user to allow sensitive data.")
 
     return None
+
+
+def _audit(tool: str, args: dict, rows: int, user: str, allow_sensitive: bool) -> None:
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "user": user,
+        "tool": tool,
+        "args": args,
+        "rows": rows,
+        "allow_sensitive": allow_sensitive,
+    }
+    try:
+        with open(catalog.AUDIT_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass
+
+
+class CallSession:
+    """One question: numbers returned (for grounding) and the audit trail."""
+
+    def __init__(self, user: str = "local", allow_sensitive: bool = False):
+        self.user = user
+        self.allow_sensitive = allow_sensitive
+        self.returned_numbers: set[int] = set()
+        self.calls: list[str] = []
+
+    def remember(self, payload) -> None:
+        if isinstance(payload, dict):
+            for v in payload.values():
+                self.remember(v)
+        elif isinstance(payload, list):
+            for v in payload:
+                self.remember(v)
+        elif isinstance(payload, (int, float)) and not isinstance(payload, bool):
+            self.returned_numbers.add(int(payload))
+
+    def finish(self, tool: str, args: dict, payload):
+        self.calls.append(tool)
+        self.remember(payload)
+        n = len(payload) if isinstance(payload, list) else 1
+        _audit(tool, args, n, self.user, self.allow_sensitive)
+        return payload
 
 
 # ===================================================================
@@ -369,7 +387,8 @@ class DBHubClient:
     def call(self, name: str, args: dict, timeout: float = CALL_TIMEOUT_SEC) -> dict:
         """Call one DBHub tool. Never raises: a failure comes back as
         {"error": ...} so agent.py's loop can show the model what went wrong
-        and let it try something else, exactly like db_tools.ToolSession.call.
+        {"error": ...} so agent.py's loop can show the model what went wrong
+        and let it try something else.
         """
         try:
             self.start()
@@ -511,26 +530,20 @@ def _unwrap(result) -> dict:
 # Tool schemas for Ollama
 # ===================================================================
 # Extra wording appended to DBHub's own descriptions. DBHub describes what its
-# tools DO; these lines tell the model when to reach for them in THIS system,
-# where curated tools already answer the common questions more reliably.
+# tools DO; these lines tell the model when to reach for them in THIS system.
 
 _GUIDANCE = {
     "execute_sql": (
-        "\n\nUSE THIS ONLY WHEN THE CURATED TOOLS CANNOT ANSWER THE QUESTION -- for "
-        "an arbitrary date range, a breakdown the curated tools do not offer, or a "
-        "comparison across tables. For a standard metric over one of the named "
-        "periods, get_metric is more reliable; for one named person or company, use "
-        "search_entities then get_records. "
-        "Write ONE read-only SELECT (a WITH ... SELECT is fine). Semicolon-separated "
-        "statements, writes, DDL, PRAGMA and EXPLAIN are refused. You may only read "
-        "the curated views; call search_objects first if you are unsure of a column "
-        "name. Alias every aggregate, e.g. SUM(amount) AS revenue."
+        "\n\nWrite ONE read-only SELECT (a WITH ... SELECT is fine) against "
+        "the SCHEMA in the system prompt. Semicolon-separated statements, "
+        "writes, DDL, PRAGMA and EXPLAIN are refused. Alias every aggregate, "
+        "e.g. SUM(amount) AS total. Do not invent table or column names."
     ),
     "search_objects": (
-        "\n\nUse this to discover the exact view and column names before writing SQL "
-        "with execute_sql. It returns names and types only, never data. Restricted "
-        "objects are omitted when the current user may not see them, so anything "
-        "missing from the results cannot be queried."
+        "\n\nOnly if SCHEMA is missing a name you need. It returns names and "
+        "types, never row data. Do not hunt for a table named after the metric "
+        "(there is no table called revenue). Restricted objects are omitted "
+        "when the current user may not see them."
     ),
 }
 
@@ -545,6 +558,95 @@ def _clean_schema(schema: dict | None) -> dict:
     out.setdefault("type", "object")
     out.setdefault("properties", {})
     return out
+
+
+def visible_tables(allow_sensitive: bool = False) -> list[str]:
+    """Table/view names DBHub can see, for the empty-state prompts."""
+    try:
+        client = get_client()
+        result = invoke(client, "search_objects",
+                        {"object_type": "table", "detail_level": "names", "limit": 40},
+                        allow_sensitive)
+    except Exception:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            name = node.get("name") or node.get("table") or node.get("view")
+            typ = str(node.get("type") or node.get("object_type") or "").lower()
+            if isinstance(name, str) and name.lower() not in seen:
+                if not typ or typ in {"table", "view", "base table", "tables", "views"}:
+                    seen.add(name.lower())
+                    names.append(name)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(result)
+    return names[:20]
+
+
+_snapshot_lock = threading.Lock()
+_snapshot_cache: dict[bool, str] = {}
+
+
+def schema_snapshot(allow_sensitive: bool = False) -> str:
+    """Compact live schema for the system prompt: `table name (col TYPE, ...)`.
+
+    Fetched here so the model does not spend its step budget guessing table
+    names with search_objects. Names only — no row counts, no sample rows.
+    """
+    with _snapshot_lock:
+        cached = _snapshot_cache.get(allow_sensitive)
+        if cached:
+            return cached
+    lines: list[str] = []
+    try:
+        client = get_client()
+        for object_type in ("table", "view"):
+            result = invoke(client, "search_objects", {
+                "object_type": object_type,
+                "detail_level": "full",
+                "limit": 40,
+            }, allow_sensitive)
+            data = result.get("data") if isinstance(result, dict) else None
+            rows = (data or {}).get("results") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                continue
+            blocked = set() if allow_sensitive else _sensitive_tokens()
+            for obj in rows:
+                if not isinstance(obj, dict):
+                    continue
+                name = obj.get("name")
+                if not isinstance(name, str) or name.lower() in blocked:
+                    continue
+                cols = []
+                for col in obj.get("columns") or []:
+                    if not isinstance(col, dict):
+                        continue
+                    cname = col.get("name")
+                    if not isinstance(cname, str) or cname.lower() in blocked:
+                        continue
+                    ctype = str(col.get("type") or "").strip()
+                    cols.append(f"{cname} {ctype}".strip() if ctype else cname)
+                    if len(cols) >= 30:
+                        break
+                coltxt = ", ".join(cols)
+                if len(obj.get("columns") or []) > 30:
+                    coltxt += ", …"
+                lines.append(f"{object_type} {name} ({coltxt})" if coltxt
+                             else f"{object_type} {name}")
+    except Exception:
+        return ""
+    text = "\n".join(lines)
+    if text:
+        with _snapshot_lock:
+            _snapshot_cache[allow_sensitive] = text
+    return text
 
 
 def tool_schemas(client: "DBHubClient") -> list[dict]:
@@ -602,10 +704,11 @@ def main() -> None:
     sql = "SELECT COUNT(*) AS n FROM v_orders"
     print(f"\nguard_sql -> {guard_sql(sql)}")
     print(f"query     -> {json.dumps(client.call('execute_sql', {'sql': sql}), ensure_ascii=False)[:400]}")
+    snap = schema_snapshot()
+    print(f"\nschema ({len(snap.splitlines())} objects)\n{snap}")
 
-    blocked = "SELECT salary FROM v_employees_sensitive"
-    print(f"\nblocked   -> {guard_sql(blocked, allow_sensitive=False)}")
-    print(f"permitted -> {guard_sql(blocked, allow_sensitive=True)}")
+    write = "DELETE FROM v_orders"
+    print(f"\nwrite blocked -> {guard_sql(write)}")
     shutdown()
 
 

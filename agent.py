@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-AGENT — connects Ollama to the database tools and to DBHub.
+AGENT — connects Ollama to DBHub.
 
-This is the loop: question -> tool call -> result -> maybe another tool
-call -> grounded answer. Curated tools (db_tools) handle the common
-shapes; DBHub's execute_sql is the escape hatch for questions those
-tools cannot express, still under guard_sql and the grounding check.
+This is the loop: question -> DBHub tool -> result -> grounded answer.
+Only two tools exist: search_objects (schema) and execute_sql (data).
 
 Run interactively:
     python agent.py
@@ -26,43 +24,61 @@ import catalog
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
-import db_tools
 import mcp_client
 
 MODEL = "gemma4:12b"
-MAX_STEPS = 8
+MAX_STEPS = 8          # SQL retries, not schema discovery. Do not raise this
+                       # to paper over search_objects loops.
 GROUNDING_RETRIES = 1
 
-SYSTEM_PROMPT = """You are a data assistant for an Egyptian company.
 
+def system_prompt(schema: str = "") -> str:
+    schema_block = ""
+    if schema:
+        schema_block = f"""
+SCHEMA — live table and column names from this database. Names only, not values.
+{schema}
+
+There is no table named after a metric (revenue, sales, salary). Those are
+columns or aggregates on the tables listed above. Search people and companies
+with name_norm. Call execute_sql on the first step.
+"""
+    discover = ("2. Never guess a table or column name. Call search_objects first."
+                if not schema else
+                "2. Use only names from SCHEMA. Do not invent tables or columns.")
+    return f"""You are a data assistant. You answer from the connected database.
+{schema_block}
 HARD RULES
-1. Never state a number, name, salary or fact that did not appear in a tool
-   result. You have no knowledge of this company's data.
-2. search_entities returns only ids and names. For salaries, departments or
-   any other detail you MUST call get_records with the id.
-3. Never guess an id. Always obtain it from search_entities first.
-4. If a search returns several matches, ask the user which one they mean.
-   Do not choose for them.
-5. If you cannot obtain the data, say so plainly. Never estimate or guess.
-6. Reply in the language of the user's LATEST message: Arabic if it is in
+1. Never state a number, name or fact that did not appear in a tool result.
+   You have no prior knowledge of the row data.
+{discover}
+3. If a search returns several matches, ask the user which one they mean.
+4. If you cannot obtain the data, say so plainly. Never estimate or guess.
+5. Reply in the language of the user's LATEST message: Arabic if it is in
    Arabic, English if it is in English. These rules are in English; that is not
    a reason to answer in English.
-7. Earlier messages show what has already been discussed, so you can tell what
+6. Earlier messages show what has already been discussed, so you can tell what
    "he", "there" or "the same period" refers to. Treat them as wording, not as
-   data: look every figure up again instead of repeating one, and never reuse an
-   id from them. They are correct as far as they go -- do not apologise for them
-   or announce corrections to them.
-8. Prefer the curated tools (get_metric, search_entities, list_entities,
-   get_records, describe_metric, list_data_areas) for standard questions.
-   Use search_objects then execute_sql only when those cannot express the
-   question -- especially a date that is not last_month, last_quarter, ytd or
-   last_year. execute_sql may only SELECT from the curated views.
+   data: look every figure up again instead of repeating one.
+7. Restricted columns and tables are hidden unless the user allowed sensitive
+   data. If a tool refuses, say so; do not invent the missing values.
+8. execute_sql may run one read-only SELECT. Alias every aggregate.
+
+QUERY SHAPE
+- Never answer a metric with a single SUM if you can GROUP BY. "Last N years"
+  with little history → GROUP BY month. A split by region or customer is a pie.
+- Always emit CHART: when the result has 2 or more groups.
 
 WHEN YOU ANSWER
-- State the figure with its unit, and name the entity it belongs to, so the
-  user can see it is the right one.
-- If a chart would help, end with one line:
-  CHART: {"type":"bar|line|pie","x":"<field>","y":"<field>","title":"<title>"}
+- State the figure with its unit or column name so the user can see it is the
+  right one.
+- If a chart would help, end with one line. Pick the type from the data:
+  pie  = a whole split into parts (revenue, amount or share by region,
+         customer, department). Use 2–8 slices, never a single total.
+  line = a value over time (day, month, quarter, year).
+  bar  = counts, rankings, or more than 8 categories.
+  Never default every chart to bar.
+  CHART: {{"type":"pie|line|bar","x":"<field>","y":"<field>","title":"<title>"}}
   Do not draw the chart yourself."""
 
 
@@ -103,22 +119,26 @@ def extract_chart(answer: str):
 
 
 def _chart_data(chart: dict | None, call_log: list[dict]):
-    """Pull the rows a chart spec refers to from actual tool results, so a
-    frontend renders real grounded numbers rather than trusting anything
-    the model wrote in the CHART spec itself."""
-    if not chart:
-        return None
+    """Build a chart from actual SQL rows. The model's CHART: line is optional;
+    a grouped query is enough. A single total stays a KPI, not a one-slice pie."""
+    requested = (chart or {}).get("type") if isinstance(chart, dict) else None
+    title = ""
+    if isinstance(chart, dict):
+        title = chart.get("title") or ""
     for entry in reversed(call_log):
         rows = _rows_from_tool_result(entry)
         if not rows:
             continue
         labels, values = _chart_series(rows)
-        if not labels:
+        if len(labels) < 2:
             continue
+        if not title:
+            keys = [k for k in rows[0].keys() if k not in {"group_key"}]
+            title = str(keys[-1]).replace("_", " ") if keys else ""
         return {
-            "type": chart.get("type", "bar"),
-            "title": chart.get("title") or entry["result"].get("metric", "") or "",
-            "unit": entry["result"].get("unit", ""),
+            "type": _choose_chart_type(labels, values, requested),
+            "title": title,
+            "unit": (chart.get("unit") if isinstance(chart, dict) else "") or "",
             "labels": labels,
             "values": values,
         }
@@ -129,8 +149,6 @@ def _rows_from_tool_result(entry: dict) -> list[dict]:
     result = entry.get("result") or {}
     if not isinstance(result, dict):
         return []
-    if entry.get("tool") == "get_metric" and result.get("results"):
-        return [r for r in result["results"] if isinstance(r, dict)]
     sets = result.get("resultSets") or []
     data = result.get("data")
     if isinstance(data, dict):
@@ -138,6 +156,46 @@ def _rows_from_tool_result(entry: dict) -> list[dict]:
     if sets and isinstance(sets[0], dict) and isinstance(sets[0].get("rows"), list):
         return [r for r in sets[0]["rows"] if isinstance(r, dict)]
     return []
+
+
+_TIME_LABEL = re.compile(
+    r"^(?:"
+    r"\d{4}(?:[-./]\d{1,2}){0,2}"
+    r"|\d{4}\s*Q[1-4]"
+    r"|Q[1-4](?:\s*\d{4})?"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    r"|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|"
+    r"سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)"
+    r")$",
+    re.I,
+)
+
+
+def _looks_like_time(labels: list[str]) -> bool:
+    if len(labels) < 2:
+        return False
+    hits = sum(1 for lab in labels if _TIME_LABEL.match(str(lab).strip()))
+    return hits >= max(2, int(len(labels) * 0.6))
+
+
+def _choose_chart_type(labels: list[str], values: list, requested=None) -> str:
+    """Type comes from the series, not from the model's CHART habit (always bar)."""
+    n = len(values)
+    nums = []
+    for val in values:
+        try:
+            nums.append(float(val))
+        except (TypeError, ValueError):
+            nums.append(0.0)
+    if _looks_like_time(labels):
+        return "line"
+    all_nonneg = bool(nums) and all(x >= 0 for x in nums)
+    want = str(requested or "").strip().lower()
+    if want == "pie" and 2 <= n <= 8 and all_nonneg:
+        return "pie"
+    if 2 <= n <= 8 and all_nonneg:
+        return "pie"
+    return "bar"
 
 
 def _chart_series(rows: list[dict]) -> tuple[list[str], list]:
@@ -191,9 +249,8 @@ def ask(question: str, user: str = "local", allow_sensitive: bool = False,
     regardless.
 
     `history` lets a follow-up such as "and in Alexandria?" make sense. It never
-    becomes a source of figures: ids in it fail the provenance guard because the
-    session below is new, and numbers in it fail the grounding check because the
-    allow-list is built only from tools called for this question."""
+    becomes a source of figures: numbers in earlier messages fail the grounding
+    check because the allow-list is built only from tools called for this question."""
     def emit(event: dict) -> None:
         if on_event is None:
             return
@@ -202,20 +259,22 @@ def ask(question: str, user: str = "local", allow_sensitive: bool = False,
         except Exception:
             pass
 
-    session = db_tools.ToolSession(user=user, allow_sensitive=allow_sensitive)
-    curated = db_tools.tool_schemas()
-    curated_names = {t["function"]["name"] for t in curated}
+    session = mcp_client.CallSession(user=user, allow_sensitive=allow_sensitive)
     hub = None
-    hub_tools = []
+    tools = []
+    schema = ""
     try:
         hub = mcp_client.get_client()
         hub.start()
-        hub_tools = mcp_client.tool_schemas(hub)
+        tools = mcp_client.tool_schemas(hub)
+        schema = mcp_client.schema_snapshot(allow_sensitive)
+        if schema:
+            tools = [t for t in tools
+                     if t.get("function", {}).get("name") != "search_objects"]
     except Exception as exc:
         emit({"type": "status", "state": "mcp_unavailable", "message": str(exc)})
-    tools = curated + hub_tools
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt(schema)},
         *_history_messages(history),
         {"role": "user", "content": question},
     ]
@@ -245,14 +304,12 @@ def ask(question: str, user: str = "local", allow_sensitive: bool = False,
                 if verbose:
                     print(f"  -> {fn['name']}({json.dumps(args, ensure_ascii=False)})")
                 emit({"type": "tool_start", "name": fn["name"], "args": args})
-                if fn["name"] in curated_names:
-                    result = session.call(fn["name"], args)
-                elif hub is not None:
+                if hub is not None:
                     result = mcp_client.invoke(
                         hub, fn["name"], args, session.allow_sensitive)
-                    result = session._finish(fn["name"], args, result)
+                    result = session.finish(fn["name"], args, result)
                 else:
-                    result = session._finish(fn["name"], args, {
+                    result = session.finish(fn["name"], args, {
                         "error": "the database MCP server is not connected",
                     })
                 call_log.append({"tool": fn["name"], "args": args, "result": result})
@@ -303,7 +360,7 @@ def ask(question: str, user: str = "local", allow_sensitive: bool = False,
         # withhold the text rather than let one through unchecked.
         if not answer.strip() or ungrounded_numbers(answer, session.returned_numbers):
             answer = ("I could not retrieve this from the database. Try naming the "
-                      "metric and period you want, or ask about one person at a time.")
+                      "table or filter you want, or ask a simpler question.")
 
     chart, text_answer = extract_chart(answer)
     out = {

@@ -62,11 +62,8 @@ const fmtNumber = (v) => typeof v === 'number' && Number.isFinite(v)
   ? v.toLocaleString('en-US', { maximumFractionDigits: 2 }) : String(v ?? '');
 
 const TOOL_DESCRIPTIONS = {
-  list_data_areas: 'listing available data',
-  search_entities: 'searching by name',
-  get_metric: 'aggregating a figure',
-  get_records: 'reading one record',
-  describe_metric: 'reading a definition',
+  search_objects: 'reading the schema',
+  execute_sql: 'running a query',
 };
 
 /* --- state ---------------------------------------------------------------- */
@@ -271,12 +268,33 @@ function renderMarkdown(src) {
 
 /* --- ChartContainer ------------------------------------------------------- */
 
+function looksLikeTime(labels) {
+  const re = /^(?:\d{4}(?:[-./]\d{1,2}){0,2}|\d{4}\s*Q[1-4]|Q[1-4](?:\s*\d{4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر))$/i;
+  const hits = (labels || []).filter((l) => re.test(String(l ?? '').trim())).length;
+  return labels.length >= 2 && hits >= Math.max(2, Math.floor(labels.length * 0.6));
+}
+
+function chooseChartType(cd) {
+  const labels = cd.labels || [];
+  const values = (cd.values || []).map((v) => Number(v) || 0);
+  const n = values.length;
+  if (looksLikeTime(labels)) return 'line';
+  const allNonNeg = n > 0 && values.every((v) => v >= 0);
+  const want = String(cd.type || '').toLowerCase();
+  if (want === 'pie' && n >= 2 && n <= 8 && allNonNeg) return 'pie';
+  if (n >= 2 && n <= 8 && allNonNeg) return 'pie';
+  return 'bar';
+}
+
 function chartContainer(cd, { loading = false } = {}) {
+  const type = chooseChartType(cd || {});
   const box = el('figure', 'chart');
   box.style.margin = '0';
+  box.dataset.type = type;
   const title = el('figcaption', 'chart-title',
     (cd?.title || 'Chart') + (cd?.unit ? ` (${cd.unit})` : ''));
   const body = el('div', 'chart-body');
+  body.dataset.type = type;
   box.append(title, body);
 
   if (loading) {
@@ -315,13 +333,15 @@ function drawChart(canvas, cd) {
   const border = cssVar('--border');
   const labels = (cd.labels || []).map((l) => String(l ?? ''));
   const values = (cd.values || []).map((v) => Number(v) || 0);
-  const type = (cd.type || 'bar').toLowerCase();
+  const type = chooseChartType(cd);
   const compact = w < 420;
 
   if (type === 'pie') {
     const total = values.reduce((a, b) => a + b, 0) || 1;
-    const r = Math.min(h, w * 0.5) / 2 - 6;
-    const cx = compact ? w / 2 : r + 12, cy = compact ? r + 8 : h / 2;
+    const legendH = compact ? labels.length * 22 + 8 : 0;
+    const r = Math.min(h - legendH, compact ? w : w * 0.42) / 2 - 8;
+    const cx = compact ? w / 2 : r + 16;
+    const cy = compact ? r + 10 : h / 2;
     let start = -Math.PI / 2;
     values.forEach((v, idx) => {
       const angle = (v / total) * Math.PI * 2;
@@ -336,14 +356,15 @@ function drawChart(canvas, cd) {
     ctx.font = `12px ${cssVar('--font-sans') || 'sans-serif'}`;
     ctx.textAlign = 'start';
     ctx.textBaseline = 'middle';
-    const lx = compact ? 8 : cx + r + 20;
-    const ly = compact ? cy + r + 18 : Math.max(12, cy - (labels.length * 20) / 2);
+    const lx = compact ? 8 : cx + r + 24;
+    const ly = compact ? cy + r + 20 : Math.max(14, cy - (labels.length * 22) / 2);
     labels.forEach((label, idx) => {
-      const y = ly + idx * 20;
+      const y = ly + idx * 22;
+      const pct = Math.round((values[idx] / total) * 100);
       ctx.fillStyle = palette[idx % palette.length];
       ctx.fillRect(lx, y - 5, 10, 10);
       ctx.fillStyle = fgMuted;
-      ctx.fillText(`${label} — ${fmtNumber(values[idx])}`, lx + 16, y);
+      ctx.fillText(`${label} — ${fmtNumber(values[idx])} (${pct}%)`, lx + 16, y);
     });
     return;
   }
@@ -446,7 +467,7 @@ function toolStatusRow(name, args, stateName = 'running', result = null) {
   row.dataset.state = stateName;
   row.setAttribute('role', 'status');
   row.dir = 'ltr';  // tool names and arguments are identifiers, never RTL prose
-  const glyph = name === 'get_metric' ? 'chart' : name === 'search_entities' ? 'search' : 'database';
+  const glyph = name === 'search_objects' ? 'search' : name === 'execute_sql' ? 'table' : 'database';
   row.insertAdjacentHTML('afterbegin', icon(result?.error ? 'alert' : glyph, 14));
   row.append(el('code', null, name));
   const detail = TOOL_DESCRIPTIONS[name] || 'reading data';
@@ -470,38 +491,78 @@ function toolSummary(calls) {
 
 /* --- data extraction (structured payload only) ---------------------------- */
 
-function metricCalls(calls) {
-  return (calls || []).filter((c) => c.tool === 'get_metric' && !c.result?.error);
+function sqlRows(result) {
+  const sets = result?.resultSets || result?.data?.statements || [];
+  const first = sets[0];
+  return Array.isArray(first?.rows) ? first.rows : null;
+}
+
+function seriesFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length < 2) return null;
+  if (rows.every((r) => r && 'group_key' in r && 'value' in r)) {
+    return {
+      labels: rows.map((r) => String(r.group_key ?? '')),
+      values: rows.map((r) => r.value),
+      title: 'value',
+    };
+  }
+  const keys = Object.keys(rows[0] || {});
+  if (keys.length < 2) return null;
+  const labelKey = keys[0];
+  let valueKey = keys[1];
+  for (const k of keys.slice(1)) {
+    if (rows.some((r) => typeof r[k] === 'number' && typeof r[k] !== 'boolean')) {
+      valueKey = k;
+      break;
+    }
+  }
+  return {
+    labels: rows.map((r) => String(r[labelKey] ?? '')),
+    values: rows.map((r) => r[valueKey]),
+    title: valueKey.replace(/_/g, ' '),
+  };
+}
+
+function chartFrom(calls) {
+  for (const call of [...(calls || [])].reverse()) {
+    const series = seriesFromRows(sqlRows(call.result));
+    if (!series) continue;
+    return {
+      type: chooseChartType(series),
+      title: series.title,
+      unit: '',
+      labels: series.labels,
+      values: series.values,
+    };
+  }
+  return null;
 }
 
 function kpiFrom(calls) {
-  const last = metricCalls(calls).at(-1);
-  const rows = last?.result?.results;
-  if (!last || !Array.isArray(rows) || rows.length !== 1 || rows[0].value == null) return null;
-  return {
-    value: rows[0].value,
-    unit: last.result.unit || '',
-    label: `${String(last.result.metric || '').replace(/_/g, ' ')} · ${String(last.result.period || '').replace(/_/g, ' ')}`,
-  };
+  for (const call of [...(calls || [])].reverse()) {
+    const res = call.result;
+    if (!res || res.error) continue;
+    const rows = sqlRows(res);
+    if (!rows || rows.length !== 1) continue;
+    const keys = Object.keys(rows[0]);
+    if (!keys.length) continue;
+    const numKey = keys.find((k) => typeof rows[0][k] === 'number') || keys[0];
+    return { value: rows[0][numKey], unit: '', label: numKey.replace(/_/g, ' ') };
+  }
+  return null;
 }
 
 function tabularFrom(calls) {
   for (const call of [...(calls || [])].reverse()) {
     const res = call.result;
     if (!res || res.error) continue;
-    if (Array.isArray(res.results) && res.results.length > 1) {
+    const rows = sqlRows(res);
+    if (Array.isArray(rows) && rows.length > 1) {
       return {
-        caption: `${String(res.metric || 'metric').replace(/_/g, ' ')} by ${res.group_by}`,
-        columns: Object.keys(res.results[0]),
-        rows: res.results,
+        caption: 'query result',
+        columns: Object.keys(rows[0]),
+        rows,
       };
-    }
-    if (Array.isArray(res.matches) && res.matches.length) {
-      return { caption: 'matches', columns: Object.keys(res.matches[0]), rows: res.matches };
-    }
-    if (call.tool === 'get_records' && typeof res === 'object' && !Array.isArray(res)) {
-      const cols = Object.keys(res).filter((k) => k !== 'error');
-      if (cols.length) return { caption: 'record', columns: cols, rows: [res] };
     }
   }
   return null;
@@ -557,8 +618,10 @@ function renderAssistantResult(turn, body, data, { onRetry }) {
   body.append(md);
 
   const kpi = kpiFrom(data.calls);
-  const cd = data.chart_data;
-  const chartable = cd && Array.isArray(cd.values) && cd.values.length &&
+  const cd = (data.chart_data && data.chart_data.values?.length > 1)
+    ? data.chart_data
+    : chartFrom(data.calls);
+  const chartable = cd && Array.isArray(cd.values) && cd.values.length > 1 &&
     Array.isArray(cd.labels) && cd.labels.length === cd.values.length;
 
   if (kpi && !chartable) {
@@ -643,19 +706,17 @@ function rawDisclosure(calls) {
 
 /* --- EmptyState / SuggestedPrompts ---------------------------------------- */
 
-const SUGGESTED = [
-  { text: 'What was revenue last quarter?', hint: 'aggregated from orders' },
-  { text: 'Show revenue by region for the year', hint: 'returns a chart' },
-  { text: 'كم كانت الإيرادات الربع الماضي؟', hint: 'يجيب بالعربية' },
-  { text: 'How is revenue calculated?', hint: 'reads the metric definition' },
+let SUGGESTED = [
+  { text: 'What tables and views are in this database?', hint: 'discovers the schema' },
+  { text: 'What data can I ask about?', hint: 'lists what is readable' },
 ];
 
 function emptyState() {
   const wrap = el('div', 'empty-state');
   const intro = el('div', 'empty-intro');
-  const h = el('h2', null, 'Ask about your company data');
+  const h = el('h2', null, 'Ask about this database');
   const p = el('p', null,
-    'Questions in Arabic or English are answered from the database. Every figure comes from a query, never from the model’s memory.');
+    'The agent reads the live schema and answers from query results, never from memory.');
   intro.append(h, p);
 
   const grid = el('div', 'prompt-grid');
@@ -757,24 +818,36 @@ function previewAnswer(question) {
   if (q.includes('region') || q.includes('منطقة')) {
     return {
       answer: 'Revenue for the year is concentrated in Cairo, which contributed **105,600 EGP** across three customers — roughly two thirds of the total. Alexandria follows at 53,400 EGP.\n\n| Region | Revenue (EGP) |\n| --- | --- |\n| Cairo | 105,600 |\n| Alexandria | 53,400 |',
-      chart_data: { type: 'bar', title: 'revenue by region', unit: 'EGP', labels: ['Cairo', 'Alexandria'], values: [105600, 53400] },
-      calls: [{ tool: 'get_metric', args: { metric: 'revenue', period: 'ytd', group_by: 'region' }, result: { metric: 'revenue', period: 'ytd', unit: 'EGP', group_by: 'region', results: [{ group_key: 'Cairo', value: 105600 }, { group_key: 'Alexandria', value: 53400 }] } }],
+      chart_data: { type: 'pie', title: 'revenue by region', unit: 'EGP', labels: ['Cairo', 'Alexandria'], values: [105600, 53400] },
+      calls: [{
+        tool: 'execute_sql',
+        args: { sql: 'SELECT region, SUM(amount) AS revenue FROM v_orders GROUP BY region' },
+        result: { success: true, data: { statements: [{ sql: '', rows: [{ region: 'Cairo', revenue: 105600 }, { region: 'Alexandria', revenue: 53400 }], count: 2 }] } },
+      }],
       ungrounded: [],
     };
   }
   if (q.includes('salary') || q.includes('راتب')) {
     return {
-      answer: 'Sara Ibrahim (id 7201, Finance) has a salary of **52,000 EGP**.\n\nThe figure comes from the restricted salary view, so it is only returned while sensitive data is allowed.',
+      answer: 'Sara Ibrahim (id 7201, Finance) has a salary of **52,000 EGP**.\n\nThe figure comes from a restricted column, so it is only returned while sensitive data is allowed.',
       calls: [
-        { tool: 'search_entities', args: { entity_type: 'employee_salary', query: 'Sara Ibrahim' }, result: { matches: [{ id: 7201, name_ar: 'سارة إبراهيم', name_en: 'Sara Ibrahim', department: 'Finance' }], count: 1 } },
-        { tool: 'get_records', args: { entity_type: 'employee_salary', entity_id: 7201 }, result: { id: 7201, name_ar: 'سارة إبراهيم', name_en: 'Sara Ibrahim', department: 'Finance', salary: 52000 } },
+        { tool: 'search_objects', args: { keywords: 'employee salary' }, result: { objects: [{ name: 'v_employees_sensitive', type: 'view' }] } },
+        {
+          tool: 'execute_sql',
+          args: { sql: "SELECT id, name_en, department, salary FROM v_employees_sensitive WHERE name_en = 'Sara Ibrahim'" },
+          result: { success: true, data: { statements: [{ sql: '', rows: [{ id: 7201, name_en: 'Sara Ibrahim', department: 'Finance', salary: 52000 }], count: 1 }] } },
+        },
       ],
       ungrounded: [],
     };
   }
   return {
     answer: 'Revenue for last quarter was **73,700 EGP** from four orders, an average of 18,425 EGP per order.\n\nThe quarter covers 2026-04-01 to 2026-06-30, and the figure is the sum of order amounts before returns and tax.',
-    calls: [{ tool: 'get_metric', args: { metric: 'revenue', period: 'last_quarter', group_by: 'none' }, result: { metric: 'revenue', period: 'last_quarter', range: ['2026-04-01', '2026-06-30'], unit: 'EGP', group_by: 'none', results: [{ value: 73700 }] } }],
+    calls: [{
+      tool: 'execute_sql',
+      args: { sql: "SELECT SUM(amount) AS revenue FROM v_orders WHERE order_date BETWEEN '2026-04-01' AND '2026-06-30'" },
+      result: { success: true, data: { statements: [{ sql: '', rows: [{ revenue: 73700 }], count: 1 }] } },
+    }],
     ungrounded: [],
   };
 }
@@ -1156,6 +1229,15 @@ function boot() {
         $('#envMeta').title = `${h.model} · ${h.db}`;
       })
       .catch(() => { $('#envMeta').textContent = 'agent offline'; });
+    fetch('/api/schema')
+      .then((r) => r.json())
+      .then((s) => {
+        if (Array.isArray(s.prompts) && s.prompts.length) {
+          SUGGESTED = s.prompts;
+          if ($('#main').dataset.empty === 'true') renderAll();
+        }
+      })
+      .catch(() => {});
   }
 
   syncScrollbarWidth();

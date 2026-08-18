@@ -9,11 +9,9 @@
 # unlimited rows, i.e. a writable database handed to a language model.
 
 [[sources]]
-id = "company"
-description = "Company demo database: employees, customers, orders, and the curated v_* views."
-# SQLite path, resolved relative to the process working directory, which
-# mcp_client.py sets to this project folder. Point this at your real database
-# when you deploy -- see README "Point it at your real database".
+id = "main"
+description = "Connected database (DSN is rewritten at startup from catalog.DB_URL)."
+# Point catalog.DB_URL at your real database. This dsn is a fallback only.
 #   sqlite:///./demo.db
 #   postgres://agent_ro:pass@dbhost:5432/yourdb?sslmode=require
 #   mysql://agent_ro:pass@dbhost:3306/yourdb
@@ -21,7 +19,7 @@ dsn = "sqlite:///./demo.db"
 
 [[tools]]
 name = "execute_sql"
-source = "company"
+source = "main"
 # Layer 1 of read-only enforcement lives here: DBHub checks each statement
 # against its read-only keyword allow-list AND runs it under SQLite's
 # PRAGMA query_only = ON. Layer 2 is mcp_client.guard_sql() in this project,
@@ -33,4 +31,4 @@ max_rows = 50
 
 [[tools]]
 name = "search_objects"
-source = "company"
+source = "main"

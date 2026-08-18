@@ -1,9 +1,7 @@
 # Runtime dependencies. Install with:  python -m pip install -r requirements.txt
 #
-# The database driver is separate: SQLite needs nothing, PostgreSQL needs
-# psycopg[binary], MySQL needs pymysql, SQL Server needs pyodbc.
+# Database access goes through DBHub (Node), not SQLAlchemy.
 
-sqlalchemy>=2.0
 ollama>=0.4
 flask>=3.0
 mcp>=1.0

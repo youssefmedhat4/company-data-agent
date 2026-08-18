@@ -11,28 +11,27 @@ Everything runs locally. No data leaves the machine.
   you type a question
          │
          ▼
-   agent.py ──────────► Ollama (gemma4:12b)   local, port 11434
-         │  ▲                    │
-         │  └── tool call ───────┘
-         ├──────────── db_tools.py     curated tools (common questions)
-         └──────────── mcp_client.py ► DBHub MCP server ► demo.db
-                           │
-                      guard_sql()      SELECT-only, views only, salary gate
+   agent.py ──────────► Ollama (gemma4:12b)
+         │  ▲
+         │  └── execute_sql  (schema is injected; not guessed)
+         ▼
+   mcp_client.py  ►  DBHub (read-only)  ►  your database
+         │
+    guard_sql()     one SELECT, optional allow-list, sensitive-name gate
 ```
 
-DBHub is the real MCP database server. `mcp_client.py` launches it as a
-read-only child process. The six curated tools still handle ordinary
-questions; `execute_sql` is for dates and breakdowns those tools cannot
-express. The grounding check runs either way.
+Python loads the live schema once and puts it in the prompt. The model’s
+job is `execute_sql`, not hunting for table names. `search_objects` stays
+available only if that snapshot fails. The grounding check still requires
+every number in the answer to have come from a tool result.
 
 | File | What it is | Do you edit it? |
 |---|---|---|
-| `catalog.py` | Your metrics, entities, connection | **Yes — this is the one** |
-| `dbhub.toml` | DBHub DSN, readonly, row cap | When pointing at a real DB |
-| `db_tools.py` | Curated tools + security | Rarely |
+| `catalog.py` | Connection, sensitive names, row cap | **Yes** |
+| `dbhub.toml` | DBHub readonly + row cap | When pointing at a real DB |
 | `mcp_client.py` | DBHub launcher + SQL guard | Rarely |
 | `agent.py` | The Ollama loop + grounding check | Rarely |
-| `setup_demo.py` | Builds a demo database | No |
+| `setup_demo.py` | Builds a sample SQLite file | No |
 
 ---
 
@@ -84,97 +83,67 @@ pip install flask
 python webapp.py
 ```
 
-Then open http://127.0.0.1:5000. It binds to localhost only -- not
-reachable from the network. There's a checkbox to allow salary lookups for
-the current question; leave it unchecked by default.
+Then open http://127.0.0.1:5000. It binds to localhost only. The lock
+button allows identifiers listed in `SENSITIVE_IDENTIFIERS`; leave it off
+by default.
 
 ---
 
 ## Point it at your real database
 
-### Step 1 — make a read-only user
+The agent is generic. It does not need a catalog of your tables. Change the
+connection, grant a read-only user, restart.
+
+### Step 1 — set the connection
+
+In `catalog.py` (or the `DB_URL` environment variable):
+
+```
+DB_URL = "postgresql+psycopg://agent_ro:pass@host:5432/yourdb"
+```
+
+DBHub is pointed at the same database at startup. Optional:
+
+```
+SENSITIVE_IDENTIFIERS=salary,ssn,password
+ALLOWED_OBJECTS=               # empty = every table/view
+```
+
+### Step 2 — make a read-only user
 
 **PostgreSQL**
 ```sql
 CREATE USER agent_ro WITH PASSWORD 'change-me';
 GRANT CONNECT ON DATABASE yourdb TO agent_ro;
 GRANT USAGE ON SCHEMA public TO agent_ro;
--- grant ONLY the views, never the tables
-GRANT SELECT ON v_employees, v_customers, v_orders TO agent_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO agent_ro;
 ```
 
-**MySQL**
-```sql
-CREATE USER 'agent_ro'@'%' IDENTIFIED BY 'change-me';
-GRANT SELECT ON yourdb.v_employees TO 'agent_ro'@'%';
-GRANT SELECT ON yourdb.v_customers TO 'agent_ro'@'%';
-GRANT SELECT ON yourdb.v_orders TO 'agent_ro'@'%';
+Prefer granting only the tables and views the agent should see. That is the
+real security boundary.
+
+Views are optional. Use them when you want to hide columns (for example
+omit `salary` from a staff view) or rename cryptic names. If you do, list
+the hidden names in `SENSITIVE_IDENTIFIERS` so `execute_sql` cannot reach
+around the view.
+
+### Step 3 — restart
+
+```powershell
+python webapp.py
 ```
 
-This is the real security boundary. Everything else is defence in depth.
+`/api/health` should show DBHub connected with tools `search_objects` and
+`execute_sql`. Suggested prompts on the empty screen come from the live schema.
 
-### Step 2 — create the views
+### Step 4 — test the database layer
 
-Views are where masking lives. Build them so the sensitive columns are simply
-not selectable:
-
-```sql
-CREATE VIEW v_employees AS
-SELECT id, name_ar, name_en, name_norm, department, hired_on
-FROM employees;              -- salary deliberately absent
+```powershell
+python mcp_client.py
 ```
 
-Views also let you rename cryptic columns into business language, which the
-model understands far better than `sal_amt_m`.
-
-### Step 3 — add normalized search columns
-
-This is what makes Arabic search work. For each searchable name column:
-
-```sql
-ALTER TABLE employees ADD COLUMN name_norm TEXT;
-
-UPDATE employees SET name_norm =
-  LOWER(
-    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-      name_ar, 'أ','ا'), 'إ','ا'), 'آ','ا'), 'ة','ه'), 'ى','ي')
-  ) || ' | ' || LOWER(name_en);
-
-CREATE INDEX idx_emp_norm ON employees(name_norm);
-```
-
-Storing **both scripts in one column** is what lets a user type `Ahmed Hassan`
-or `أحمد حسن` and get the same result. Keep it updated with a trigger, or
-regenerate on a schedule.
-
-### Step 4 — edit `catalog.py`
-
-```python
-DB_URL = "postgresql+psycopg://agent_ro:pass@dbhost:5432/yourdb"
-```
-
-Then rewrite `ENTITIES`, `METRICS` and `PERIODS` for your data. Start with
-**three metrics and two entities.** Add more only after those work.
-
-Adjust `PERIODS` to your fiscal calendar — the dates in the demo are fixed
-strings, so update them or compute them from today's date.
-
-### Step 5 — install the driver
-
-| Database | Package |
-|---|---|
-| PostgreSQL | `pip install psycopg[binary]` |
-| MySQL | `pip install pymysql` |
-| SQL Server | `pip install pyodbc` |
-| SQLite | built in |
-
-### Step 6 — test before connecting the model
-
-```python
-python -c "import db_tools; s=db_tools.ToolSession(); print(s.list_data_areas())"
-```
-
-If that returns your metrics, the database layer works. Only then run `agent.py`.
+That starts DBHub, lists its tools, and runs one guarded SELECT. Only then
+run `python webapp.py` or `python agent.py`.
 
 ---
 
@@ -208,14 +177,10 @@ DB_URL = os.environ["DB_URL"]
 
 | Control | Enforced in |
 |---|---|
-| Read-only access | Database user grant |
-| Column masking | The views |
-| Row limit (50) | `db_tools._select` |
-| SELECT-only | `db_tools._select` |
-| No SQL injection | Parameterized queries throughout |
-| ID provenance | `ToolSession.get_records` |
-| Sensitive entities gated | `allow_sensitive` flag |
-| Bidi characters stripped | `db_tools._clean` |
+| Read-only access | Database user grant + DBHub `readonly` |
+| Row limit (50) | `dbhub.toml` + `guard_sql` cap |
+| SELECT-only | `mcp_client.guard_sql` |
+| Sensitive names gated | `SENSITIVE_IDENTIFIERS` + privacy toggle |
 | No invented numbers | Grounding check in `agent.py` |
 | Audit trail | `audit.log`, one JSON line per call |
 
@@ -257,16 +222,15 @@ To point at a real database, edit `dbhub.toml` (`dsn`) and `catalog.py`
 
 ## Troubleshooting
 
-**"No module named sqlalchemy"** → `python -m pip install sqlalchemy`
+**DBHub will not start** → `npm install`, then `python mcp_client.py`. Node
+must be 22.5 or newer (this repo pins 22.22.0 under `node_modules`).
 
-**Search returns nothing** → the `name_norm` column is missing or not populated.
-Check with `SELECT name_norm FROM v_employees LIMIT 5`.
+**execute_sql refused** → one SELECT only. Writes, PRAGMA, EXPLAIN, and extra
+statements are blocked. Sensitive names in `SENSITIVE_IDENTIFIERS` need the
+privacy toggle. If `ALLOWED_OBJECTS` is set, FROM/JOIN must stay inside it.
 
-**"id X was not returned by search_entities"** → working as intended. The model
-tried to use an ID it never received. It should search first.
-
-**Model invents numbers** → check `audit.log` to see what the tools actually
-returned. Usually the tool returned nothing useful and the model filled the gap.
+**Model invents numbers** → check `audit.log` for the last `execute_sql`
+result. Usually the query returned nothing useful and the model filled the gap.
 
 **Slow responses** → `ollama ps` shows whether the model is loaded on GPU or
 CPU. CPU inference on a 12B model is minutes, not seconds.
